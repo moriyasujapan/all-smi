@@ -20,6 +20,11 @@ pub mod chassis;
 // Common caching utilities shared across all readers
 pub mod common_cache;
 
+// Shared `GpuInfo::detail` key conventions. Always compiled: its helpers
+// are called from layers with disjoint cfg gates (windows_gpu_perf,
+// intel_gpu_level_zero, amd_adl), so it cannot live inside any of them.
+pub mod detail_keys;
+
 // Native Apple Silicon reader using IOReport/SMC (no sudo required)
 #[cfg(target_os = "macos")]
 pub mod apple_silicon_native;
@@ -68,18 +73,30 @@ pub mod intel_gpu_engine;
 pub mod intel_gpu_fdinfo;
 #[cfg(target_os = "linux")]
 pub mod intel_gpu_gtidle;
-// Opt-in Intel Level Zero (oneAPI) backend. Cross-platform FFI shim that
-// prefers Sysman metrics per field when available, while keeping sysfs/WMI
-// as the baseline and fallback. Enabled with `--features level_zero`;
-// default builds do not pull this module in or link Level Zero symbols.
-#[cfg(all(
-    any(target_os = "linux", target_os = "windows"),
-    feature = "level_zero"
-))]
+// Intel Level Zero (oneAPI) backend. Cross-platform FFI shim that prefers
+// Sysman metrics per field when available, while keeping sysfs/WMI as the
+// baseline and fallback.
+//
+// Gated on the `all_smi_level_zero` cfg alias emitted by `build.rs`:
+// always on when targeting Windows (the loader ships with the Intel
+// driver and nothing else supplies temperature / power / frequency
+// there), opt-in elsewhere via `--features level_zero`. No symbols are
+// linked either way — the loader is `dlopen`ed at runtime.
+//
+// The `test` arm is additive: without it this module's ~800 lines of unit
+// tests never ran in CI at all, since the only always-on runner is
+// ubuntu-latest building with default features. Restricted to Linux
+// because `libloading` is not a macOS dependency.
+#[cfg(any(all_smi_level_zero, all(test, target_os = "linux")))]
 pub mod intel_gpu_level_zero;
 #[cfg(target_os = "linux")]
 pub mod intel_gpu_linux;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+// The `test` arm is load-bearing: `intel_gpu_windows/tests.rs` never runs
+// in CI (its parent module is Windows-gated, and the only always-on runner
+// is ubuntu-latest), so the architecture and discrete-vs-integrated
+// classifiers are tested here instead. Same reasoning as
+// `windows_gpu_perf` below.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub mod intel_gpu_names;
 // The helpers themselves only use portable filesystem APIs, so keep their unit
 // tests available on non-Linux development hosts as well.

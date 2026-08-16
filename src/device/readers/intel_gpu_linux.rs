@@ -123,7 +123,7 @@ struct IntelGpuCard {
     /// Per-card Level Zero handle state (issue #248). Mirrors
     /// `engine_state` — delta-tracked behind a `Mutex` for power
     /// readings, only present when `--features level_zero` is active.
-    #[cfg(feature = "level_zero")]
+    #[cfg(all_smi_level_zero)]
     level_zero_state: Mutex<crate::device::readers::intel_gpu_level_zero::LevelZeroState>,
 }
 
@@ -565,7 +565,7 @@ impl GpuReader for IntelGpuReader {
             // `GpuInfo` is pushed. On hosts without the L0 runtime, or
             // for cards L0 cannot bind to, this is a noop and the
             // sysfs baseline remains unchanged.
-            #[cfg(feature = "level_zero")]
+            #[cfg(all_smi_level_zero)]
             level_zero_glue::augment(card, &mut out, &device_dir);
         }
 
@@ -644,7 +644,7 @@ fn discover_cards(drm_root: &Path) -> Vec<IntelGpuCard> {
                 energy_uj: 0,
                 last_cache_write: None,
             }),
-            #[cfg(feature = "level_zero")]
+            #[cfg(all_smi_level_zero)]
             level_zero_state: Mutex::new(
                 crate::device::readers::intel_gpu_level_zero::LevelZeroState::empty(),
             ),
@@ -773,7 +773,7 @@ pub fn has_intel_client_gpu() -> bool {
     detection::has_intel_client_gpu_from_root(Path::new("/sys/class/drm"))
 }
 
-#[cfg(feature = "level_zero")]
+#[cfg(all_smi_level_zero)]
 #[path = "intel_gpu_linux/level_zero_glue.rs"]
 mod level_zero_glue;
 

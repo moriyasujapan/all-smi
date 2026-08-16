@@ -199,6 +199,118 @@ fn windows_overwrites_wmi_gaps() {
 }
 
 #[test]
+fn windows_metrics_source_appends_rather_than_replaces() {
+    // On a real Windows host three layers run before Level Zero: the WMI
+    // baseline, then DXGI, then PDH. This used to *assign* the string,
+    // reporting a bare "WMI + Level Zero Sysman" and erasing the record
+    // that DXGI and PDH had contributed — observed verbatim on an Intel
+    // Arc B390 machine.
+    let mut gpu = make_baseline_gpu_info();
+    gpu.detail
+        .insert("Metrics Source".to_string(), "WMI + DXGI + PDH".to_string());
+
+    let readout = LevelZeroReadout {
+        frequency_mhz: Some(FreshValue::level_zero(900)),
+        ..Default::default()
+    };
+    apply_to_gpu_info(&mut gpu, &readout, ApplyPlatform::Windows);
+
+    assert_eq!(
+        gpu.detail.get("Metrics Source").map(String::as_str),
+        Some("WMI + DXGI + PDH + Level Zero Sysman")
+    );
+
+    // Idempotent across polls — the collector calls this every interval.
+    apply_to_gpu_info(&mut gpu, &readout, ApplyPlatform::Windows);
+    assert_eq!(
+        gpu.detail.get("Metrics Source").map(String::as_str),
+        Some("WMI + DXGI + PDH + Level Zero Sysman")
+    );
+}
+
+#[test]
+fn windows_l0_memory_does_not_clobber_a_shared_dxgi_total() {
+    // An integrated GPU's L0 "device" memory module is the small stolen
+    // carve-out, not the shared aperture DXGI resolved. Overwriting would
+    // put a 128 MiB total back on an Arc B390 and undo the memory fix.
+    let mut gpu = make_baseline_gpu_info();
+    gpu.total_memory = 16_844_224_512;
+    gpu.used_memory = 14_052_360_192;
+    gpu.detail
+        .insert("Source: Memory".to_string(), "DXGI (shared)".to_string());
+
+    let readout = LevelZeroReadout {
+        memory: Some(LevelZeroMemoryReadout {
+            used_bytes: 0,
+            total_bytes: 134_217_728,
+            kind: LevelZeroMemoryKind::DedicatedLocal,
+            source: "Level Zero Sysman",
+        }),
+        frequency_mhz: Some(FreshValue::level_zero(900)),
+        ..Default::default()
+    };
+    apply_to_gpu_info(&mut gpu, &readout, ApplyPlatform::Windows);
+
+    assert_eq!(gpu.total_memory, 16_844_224_512);
+    assert_eq!(gpu.used_memory, 14_052_360_192);
+    assert_eq!(
+        gpu.detail.get("Source: Memory").map(String::as_str),
+        Some("DXGI (shared)")
+    );
+    // Frequency, which L0 is authoritative for, still applies.
+    assert_eq!(gpu.frequency, 900);
+}
+
+#[test]
+fn windows_l0_memory_still_wins_on_a_dedicated_adapter() {
+    // The guard must be narrow: a discrete card where DXGI reported a real
+    // dedicated pool should still take L0's more precise figures.
+    let mut gpu = make_baseline_gpu_info();
+    gpu.detail
+        .insert("Source: Memory".to_string(), "DXGI".to_string());
+
+    let readout = LevelZeroReadout {
+        memory: Some(LevelZeroMemoryReadout {
+            used_bytes: 2 * 1024 * 1024 * 1024,
+            total_bytes: 12 * 1024 * 1024 * 1024,
+            kind: LevelZeroMemoryKind::DedicatedLocal,
+            source: "Level Zero Sysman",
+        }),
+        ..Default::default()
+    };
+    apply_to_gpu_info(&mut gpu, &readout, ApplyPlatform::Windows);
+
+    assert_eq!(gpu.used_memory, 2 * 1024 * 1024 * 1024);
+    assert_eq!(
+        gpu.detail.get("Source: Memory").map(String::as_str),
+        Some("Level Zero Sysman")
+    );
+}
+
+#[test]
+fn a_zero_total_memory_readout_is_ignored() {
+    // A zero capacity is a driver declining to answer, not a capacity.
+    let mut gpu = make_baseline_gpu_info();
+    gpu.total_memory = 12 * 1024 * 1024 * 1024;
+    gpu.used_memory = 1024;
+
+    let readout = LevelZeroReadout {
+        memory: Some(LevelZeroMemoryReadout {
+            used_bytes: 0,
+            total_bytes: 0,
+            kind: LevelZeroMemoryKind::DedicatedLocal,
+            source: "Level Zero Sysman",
+        }),
+        frequency_mhz: Some(FreshValue::level_zero(1200)),
+        ..Default::default()
+    };
+    apply_to_gpu_info(&mut gpu, &readout, ApplyPlatform::Linux);
+
+    assert_eq!(gpu.total_memory, 12 * 1024 * 1024 * 1024);
+    assert_eq!(gpu.used_memory, 1024);
+}
+
+#[test]
 fn duty_cycle_only_fan_leaves_the_typed_field_unset() {
     // Some drivers report a fan percentage with no tachometer. A
     // percentage stored in a field named `_rpm` would be exported as a

@@ -21,7 +21,15 @@
 //! |---|---|---|
 //! | `\GPU Engine(*)\Utilization Percentage` | rate | device utilization |
 //! | `\GPU Adapter Memory(*)\Dedicated Usage` | gauge | system-wide used VRAM |
+//! | `\GPU Adapter Memory(*)\Shared Usage` | gauge | system-wide used shared memory |
 //! | `\GPU Process Memory(*)\Dedicated Usage` | gauge | per-process VRAM |
+//! | `\GPU Process Memory(*)\Shared Usage` | gauge | per-process shared memory |
+//!
+//! Both `Shared Usage` families exist because an integrated GPU reports a
+//! flat 0 for every `Dedicated Usage` instance — nothing is allocated out
+//! of its small stolen carve-out, and the real consumption sits in the
+//! shared aperture. Sampling only the dedicated counters made all-smi
+//! report `used_memory: 0` for every Intel and AMD iGPU on Windows.
 //!
 //! This is the same data Task Manager's GPU pane shows, and it is
 //! vendor-neutral: AMD, Intel, and NVIDIA adapters all publish it
@@ -87,15 +95,21 @@ pub struct PdhSample {
     pub utilization: HashMap<AdapterLuid, f64>,
     /// System-wide dedicated VRAM in use, per adapter, in bytes.
     pub adapter_memory: HashMap<AdapterLuid, u64>,
+    /// System-wide shared GPU memory in use, per adapter, in bytes.
+    pub adapter_shared_memory: HashMap<AdapterLuid, u64>,
     /// Dedicated VRAM in use per (pid, adapter), in bytes.
     pub process_memory: Vec<(GpuProcessMemoryInstance, u64)>,
+    /// Shared GPU memory in use per (pid, adapter), in bytes.
+    pub process_shared_memory: Vec<(GpuProcessMemoryInstance, u64)>,
 }
 
 struct GpuCounterQuery {
     query: PDH_HQUERY,
     engine: PDH_HCOUNTER,
     adapter_memory: PDH_HCOUNTER,
+    adapter_shared_memory: PDH_HCOUNTER,
     process_memory: PDH_HCOUNTER,
+    process_shared_memory: PDH_HCOUNTER,
     /// Set once a collection has happened, which is when the rate
     /// counter starts producing values.
     primed: bool,
@@ -137,14 +151,20 @@ impl GpuCounterQuery {
         // fields.
         let adapter_memory =
             add_counter(query, w!("\\GPU Adapter Memory(*)\\Dedicated Usage")).unwrap_or_default();
+        let adapter_shared_memory =
+            add_counter(query, w!("\\GPU Adapter Memory(*)\\Shared Usage")).unwrap_or_default();
         let process_memory =
             add_counter(query, w!("\\GPU Process Memory(*)\\Dedicated Usage")).unwrap_or_default();
+        let process_shared_memory =
+            add_counter(query, w!("\\GPU Process Memory(*)\\Shared Usage")).unwrap_or_default();
 
         Some(Self {
             query,
             engine,
             adapter_memory,
+            adapter_shared_memory,
             process_memory,
+            process_shared_memory,
             primed: false,
         })
     }
@@ -170,31 +190,45 @@ impl GpuCounterQuery {
             sample.utilization = aggregate_engine_utilization(engine_samples);
         }
 
-        if !self.adapter_memory.is_invalid() {
-            let adapter_samples = read_counter_array(self.adapter_memory)
-                .into_iter()
-                .filter_map(|(name, value)| {
-                    parse_gpu_adapter_memory_instance(&name).map(|instance| (instance, value))
-                })
-                .collect::<Vec<(GpuAdapterMemoryInstance, f64)>>();
-            sample.adapter_memory = aggregate_adapter_memory(adapter_samples);
-        }
-
-        if !self.process_memory.is_invalid() {
-            sample.process_memory = read_counter_array(self.process_memory)
-                .into_iter()
-                .filter_map(|(name, value)| {
-                    if !value.is_finite() || value < 0.0 {
-                        return None;
-                    }
-                    parse_gpu_process_memory_instance(&name)
-                        .map(|instance| (instance, value as u64))
-                })
-                .collect();
-        }
+        sample.adapter_memory = read_adapter_memory(self.adapter_memory);
+        sample.adapter_shared_memory = read_adapter_memory(self.adapter_shared_memory);
+        sample.process_memory = read_process_memory(self.process_memory);
+        sample.process_shared_memory = read_process_memory(self.process_shared_memory);
 
         sample
     }
+}
+
+/// Read and aggregate one `GPU Adapter Memory` counter into per-adapter
+/// totals. Empty when the counter was never added.
+fn read_adapter_memory(counter: PDH_HCOUNTER) -> HashMap<AdapterLuid, u64> {
+    if counter.is_invalid() {
+        return HashMap::new();
+    }
+    let samples = read_counter_array(counter)
+        .into_iter()
+        .filter_map(|(name, value)| {
+            parse_gpu_adapter_memory_instance(&name).map(|instance| (instance, value))
+        })
+        .collect::<Vec<(GpuAdapterMemoryInstance, f64)>>();
+    aggregate_adapter_memory(samples)
+}
+
+/// Read one `GPU Process Memory` counter into `(instance, bytes)` rows.
+/// Empty when the counter was never added.
+fn read_process_memory(counter: PDH_HCOUNTER) -> Vec<(GpuProcessMemoryInstance, u64)> {
+    if counter.is_invalid() {
+        return Vec::new();
+    }
+    read_counter_array(counter)
+        .into_iter()
+        .filter_map(|(name, value)| {
+            if !value.is_finite() || value < 0.0 {
+                return None;
+            }
+            parse_gpu_process_memory_instance(&name).map(|instance| (instance, value as u64))
+        })
+        .collect()
 }
 
 fn add_counter(query: PDH_HQUERY, path: PCWSTR) -> Option<PDH_HCOUNTER> {

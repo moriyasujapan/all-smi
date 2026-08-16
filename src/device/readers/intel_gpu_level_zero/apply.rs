@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::{LevelZeroFanReadout, LevelZeroMemoryKind, LevelZeroReadout};
+use crate::device::readers::detail_keys::note_metrics_source;
 use crate::device::types::{GpuInfo, MAX_GPU_FAN_RPM};
 
 #[derive(Debug, Clone, Copy)]
@@ -51,7 +52,17 @@ pub fn apply_to_gpu_info(
     }
     if let Some(memory) = readout.memory {
         match memory.kind {
-            LevelZeroMemoryKind::DedicatedLocal => {
+            // Two guards before trusting this over what the caller already
+            // had. A zero total is not a capacity, it is a driver that
+            // declined to answer. And on Windows an integrated GPU's
+            // "device" memory module is the small stolen carve-out, not the
+            // shared aperture DXGI resolved — overwriting there would undo
+            // the correct figure and put a 128 MiB total back on an Arc
+            // B390. `Source: Memory` records which of the two we have.
+            LevelZeroMemoryKind::DedicatedLocal
+                if memory.total_bytes > 0
+                    && !dxgi_resolved_a_shared_aperture(gpu_info, platform) =>
+            {
                 gpu_info.total_memory = memory.total_bytes;
                 gpu_info.used_memory = memory.used_bytes.min(memory.total_bytes);
                 set_source(gpu_info, "Memory", memory.source);
@@ -60,6 +71,7 @@ pub fn apply_to_gpu_info(
                     format!("{} bytes", memory.total_bytes),
                 );
             }
+            LevelZeroMemoryKind::DedicatedLocal => {}
             LevelZeroMemoryKind::SharedSystem => {
                 gpu_info.detail.insert(
                     "Memory (L0)".to_string(),
@@ -86,6 +98,11 @@ pub fn apply_to_gpu_info(
                 gpu_info.detail.remove("Utilization");
             }
             apply_fan(gpu_info, readout.fan, false);
+            // Linux assigns rather than appends: the sysfs reader writes a
+            // descriptive baseline ("sysfs (engine counters)", "sysfs
+            // (gtidle)", ...) and this collapses whichever variant ran into
+            // one canonical string. Only one layer precedes us here, so
+            // nothing is lost — unlike on Windows, where three do.
             gpu_info.detail.insert(
                 "Metrics Source".to_string(),
                 "sysfs + Level Zero Sysman".to_string(),
@@ -97,12 +114,27 @@ pub fn apply_to_gpu_info(
                 set_source(gpu_info, "Utilization", primary.source);
             }
             apply_fan(gpu_info, readout.fan, true);
-            gpu_info.detail.insert(
-                "Metrics Source".to_string(),
-                "WMI + Level Zero Sysman".to_string(),
-            );
+            // Append, never assign: the WMI baseline and the DXGI / PDH
+            // layer have both already run and recorded themselves. Setting
+            // the string here used to erase them, reporting a bare
+            // "WMI + Level Zero Sysman" on hosts where all four contributed.
+            note_metrics_source(&mut gpu_info.detail, "Level Zero Sysman");
         }
     }
+}
+
+/// Whether the caller already resolved this GPU's capacity to an
+/// integrated adapter's shared aperture.
+///
+/// Only meaningful on Windows, where `windows_gpu_perf` runs first and
+/// stamps the provenance. On Linux the sysfs reader owns the memory
+/// fields and no such marker exists, so this is always `false` there.
+fn dxgi_resolved_a_shared_aperture(gpu_info: &GpuInfo, platform: ApplyPlatform) -> bool {
+    matches!(platform, ApplyPlatform::Windows)
+        && gpu_info
+            .detail
+            .get("Source: Memory")
+            .is_some_and(|source| source.contains("shared"))
 }
 
 fn set_source(gpu_info: &mut GpuInfo, field: &str, source: &str) {

@@ -315,9 +315,27 @@ fn version_dump(report: &Report) -> String {
     let version = &report.version;
     let schema = report.schema;
     let timestamp = &report.timestamp;
+    let level_zero = level_zero_effective();
     format!(
-        "all-smi {version}\nschema: {schema}\ntimestamp: {timestamp}\nfeatures: {features}\nruntime: {triple}\n"
+        "all-smi {version}\nschema: {schema}\ntimestamp: {timestamp}\nfeatures: {features}\nlevel_zero: {level_zero}\nruntime: {triple}\n"
     )
+}
+
+/// Whether the Intel Level Zero backend was compiled into this binary.
+///
+/// Deliberately separate from [`enabled_features`], which is contractually
+/// a list of enabled *cargo features*. Level Zero is not purely a feature:
+/// `build.rs` turns it on for every Windows target regardless of
+/// `--features level_zero`, so on Windows the feature list says nothing
+/// about whether the backend is present. That distinction is precisely
+/// what someone reading a support bundle needs, because it decides whether
+/// GPU temperature, power, and frequency can be collected at all.
+fn level_zero_effective() -> &'static str {
+    if cfg!(all_smi_level_zero) {
+        "compiled-in"
+    } else {
+        "absent"
+    }
 }
 
 fn enabled_features() -> Vec<&'static str> {
@@ -590,6 +608,51 @@ mod tests {
                 "feature `{name}` compiled in: {compiled_in}, but reported list is {features:?}"
             );
         }
+    }
+
+    /// The effective Level Zero state is reported separately from the
+    /// cargo-feature list, and tracks the `all_smi_level_zero` cfg alias
+    /// rather than `--features level_zero`.
+    ///
+    /// The two diverge on Windows by design: `build.rs` turns the backend
+    /// on for every Windows target, so a default Windows build reports
+    /// `level_zero: compiled-in` while `features:` correctly omits it.
+    #[test]
+    fn level_zero_effective_tracks_the_cfg_alias() {
+        assert_eq!(
+            level_zero_effective() == "compiled-in",
+            cfg!(all_smi_level_zero),
+        );
+
+        // The feature always implies the alias; the reverse holds only off
+        // Windows.
+        if cfg!(feature = "level_zero") {
+            assert_eq!(level_zero_effective(), "compiled-in");
+        }
+        if cfg!(target_os = "windows") {
+            assert_eq!(level_zero_effective(), "compiled-in");
+        }
+    }
+
+    #[test]
+    fn version_dump_reports_the_level_zero_state() {
+        let report = Report {
+            schema: 1,
+            version: "0.99.9".to_string(),
+            timestamp: "2026-04-20T00:00:00Z".to_string(),
+            summary: Summary {
+                pass: 0,
+                warn: 0,
+                fail: 0,
+                skip: 0,
+            },
+            checks: vec![],
+        };
+        let dump = version_dump(&report);
+        assert!(
+            dump.contains(&format!("level_zero: {}", level_zero_effective())),
+            "version.txt must record the effective Level Zero state, got:\n{dump}"
+        );
     }
 
     #[test]

@@ -13,7 +13,14 @@
 // limitations under the License.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    emit_level_zero_cfg();
+
     // Only compile proto files on Linux (TPU is Linux-only)
+    //
+    // NOTE: `#[cfg(target_os)]` in a build script describes the *host*,
+    // not the build target. That is benign here (a Linux host is the only
+    // one that cross-compiles the TPU protos anyway) but it is the wrong
+    // idiom in general — see `emit_level_zero_cfg` for the correct form.
     #[cfg(target_os = "linux")]
     {
         let proto_file = "proto/tpu_metric_service.proto";
@@ -31,4 +38,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Emit the `all_smi_level_zero` cfg alias.
+///
+/// The Intel Level Zero backend is opt-in on Linux and macOS (via the
+/// `level_zero` cargo feature) but **always compiled on Windows**: it
+/// pulls in no extra crates — it `dlopen`s `ze_loader.dll` through
+/// `libloading`, already an unconditional Windows dependency — and that
+/// loader ships with the Intel graphics driver. Without it, Windows hosts
+/// get no GPU temperature, power, or frequency at all.
+///
+/// Cargo cannot express "this feature defaults on for one target", hence
+/// the cfg alias. Every consumer then writes a single uniform
+/// `#[cfg(all_smi_level_zero)]` instead of repeating the disjunction.
+///
+/// Note `CARGO_CFG_TARGET_OS`, not `#[cfg(target_os = ...)]`: inside a
+/// build script the latter describes the *host*, which would silently do
+/// the wrong thing when cross-compiling to Windows from Linux (as the
+/// `cargo xwin` check and the release workflow both do).
+fn emit_level_zero_cfg() {
+    println!("cargo::rustc-check-cfg=cfg(all_smi_level_zero)");
+
+    let targets_windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    let feature_requested = std::env::var_os("CARGO_FEATURE_LEVEL_ZERO").is_some();
+    if targets_windows || feature_requested {
+        println!("cargo::rustc-cfg=all_smi_level_zero");
+    }
 }

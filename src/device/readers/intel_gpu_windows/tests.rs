@@ -17,6 +17,7 @@
 //! mirroring the `intel_gpu_linux/tests.rs` split.
 
 use super::*;
+use crate::device::readers::intel_gpu_names::{intel_variant, is_arc_model_token};
 
 #[test]
 fn intel_arc_a770_recognised() {
@@ -79,11 +80,11 @@ fn non_intel_excluded() {
 #[test]
 fn classify_arc_discrete() {
     assert_eq!(
-        classify_intel_variant("Intel(R) Arc(TM) A770 Graphics"),
+        intel_variant(None, "Intel(R) Arc(TM) A770 Graphics"),
         "Discrete"
     );
     assert_eq!(
-        classify_intel_variant("Intel(R) Arc(TM) B580 Graphics"),
+        intel_variant(None, "Intel(R) Arc(TM) B580 Graphics"),
         "Discrete"
     );
 }
@@ -91,7 +92,7 @@ fn classify_arc_discrete() {
 #[test]
 fn classify_iris_integrated() {
     assert_eq!(
-        classify_intel_variant("Intel(R) Iris(R) Xe Graphics"),
+        intel_variant(None, "Intel(R) Iris(R) Xe Graphics"),
         "Integrated"
     );
 }
@@ -99,7 +100,7 @@ fn classify_iris_integrated() {
 #[test]
 fn classify_uhd_integrated() {
     assert_eq!(
-        classify_intel_variant("Intel(R) UHD Graphics 770"),
+        intel_variant(None, "Intel(R) UHD Graphics 770"),
         "Integrated"
     );
 }
@@ -109,7 +110,7 @@ fn classify_meteor_lake_arc_igpu_as_integrated() {
     // "Intel Arc Graphics" without a model number on Core Ultra is
     // the iGPU and must NOT be classified as Discrete.
     assert_eq!(
-        classify_intel_variant("Intel(R) Arc(TM) Graphics"),
+        intel_variant(None, "Intel(R) Arc(TM) Graphics"),
         "Integrated"
     );
 }
@@ -240,6 +241,103 @@ fn intel_wifi_excluded() {
 }
 
 // ---------- Architecture classifier wiring ----------
+
+// ---------- Missing-metric annotation ----------
+//
+// Which fields count as missing is covered in `detail_keys` (which the CI
+// runner actually compiles). What is left here is the wording.
+
+fn gpu_with_sources(pairs: &[(&str, &str)]) -> GpuInfo {
+    let mut gpu = blank_gpu_info();
+    for (field, source) in pairs {
+        gpu.detail
+            .insert(format!("Source: {field}"), (*source).to_string());
+    }
+    gpu
+}
+
+fn blank_gpu_info() -> GpuInfo {
+    GpuInfo {
+        uuid: String::new(),
+        time: String::new(),
+        name: "Intel(R) Arc(TM) B390 GPU".to_string(),
+        device_type: "GPU".to_string(),
+        host_id: String::new(),
+        hostname: String::new(),
+        instance: String::new(),
+        utilization: 0.0,
+        ane_utilization: 0.0,
+        dla_utilization: None,
+        tensorcore_utilization: None,
+        temperature: 0,
+        used_memory: 0,
+        total_memory: 0,
+        frequency: 0,
+        power_consumption: 0.0,
+        gpu_core_count: None,
+        temperature_threshold_slowdown: None,
+        temperature_threshold_shutdown: None,
+        temperature_threshold_max_operating: None,
+        temperature_threshold_acoustic: None,
+        performance_state: None,
+        fan_speed_rpm: None,
+        numa_node_id: None,
+        gsp_firmware_mode: None,
+        gsp_firmware_version: None,
+        nvlink_remote_devices: Vec::new(),
+        gpm_metrics: None,
+        detail: HashMap::new(),
+    }
+}
+
+#[test]
+fn a_fully_sourced_gpu_carries_no_note() {
+    let mut gpu = gpu_with_sources(&[
+        ("Temperature", "Level Zero Sysman"),
+        ("Power", "Level Zero Sysman"),
+        ("Frequency", "Level Zero Sysman"),
+        ("Utilization", "PDH"),
+    ]);
+    // A stale note from an earlier poll must be cleared, not left behind.
+    gpu.detail
+        .insert("Note".to_string(), "something old".to_string());
+
+    annotate_missing_metrics(&mut gpu);
+
+    assert!(!gpu.detail.contains_key("Note"));
+}
+
+#[test]
+fn the_note_names_only_the_missing_fields() {
+    // The real Arc B390 shape: everything resolves except temperature,
+    // because an Intel iGPU exposes no Sysman thermal sensor.
+    let mut gpu = gpu_with_sources(&[
+        ("Temperature", "unavailable"),
+        ("Power", "Level Zero Sysman"),
+        ("Frequency", "Level Zero Sysman"),
+        ("Utilization", "PDH"),
+    ]);
+    annotate_missing_metrics(&mut gpu);
+
+    let note = gpu.detail.get("Note").expect("note expected");
+    assert!(note.starts_with("Temperature unavailable"), "got: {note}");
+    // Fields that DID resolve must not be blamed.
+    assert!(!note.contains("Power"), "got: {note}");
+    assert!(!note.contains("Frequency"), "got: {note}");
+    assert!(!note.contains("Utilization"), "got: {note}");
+}
+
+#[test]
+fn the_note_does_not_ask_for_a_rebuild_when_level_zero_is_compiled_in() {
+    // Windows always compiles the backend, so telling the operator to
+    // rebuild would send them down a dead end.
+    let mut gpu = gpu_with_sources(&[("Temperature", "unavailable")]);
+    annotate_missing_metrics(&mut gpu);
+
+    let note = gpu.detail.get("Note").expect("note expected");
+    assert!(!note.contains("--features"), "got: {note}");
+    assert!(note.contains("ze_loader.dll"), "got: {note}");
+}
 
 #[test]
 fn sycl_capable_label_renders_known_yes_no_unknown() {

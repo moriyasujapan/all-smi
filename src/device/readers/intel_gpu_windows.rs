@@ -19,24 +19,30 @@
 //! template. The only differences are the vendor / family filter and a
 //! discrete-vs-integrated heuristic surfaced in `detail["Variant"]`.
 //!
-//! ## WMI-only baseline limitations
+//! ## Layering
 //!
-//! Detailed metrics (utilization, temperature, fine-grained power) are
-//! **not** available through WMI for Intel client GPUs. The WMI-only
-//! baseline therefore returns `0` for those fields and writes a
-//! `detail["Note"]` entry that points operators at Level Zero.
+//! `Win32_VideoController` publishes no utilization, no temperature and
+//! no power, so the WMI query is only a baseline that names the card.
+//! Three layers stack on top of it, each outranking the last:
 //!
-//! Issue #248 added an opt-in Level Zero augmentation behind the
-//! `level_zero` Cargo feature. When the build includes the feature
-//! AND the L0 loader (`ze_loader.dll`) is present at runtime, the
-//! augmentation overwrites the WMI zeros for `GpuInfo.utilization`
-//! and `GpuInfo.power_consumption` and flips
-//! `detail["Metrics Source"]` from `"WMI"` to `"WMI + Level Zero"`.
-//! Without the feature or the runtime the reader behaves exactly as
-//! before — there is no regression for hosts that lack either.
+//! 1. **WMI** — name, driver version, PCI ids, and the discrete-vs-
+//!    integrated verdict (from the device ID, see [`intel_variant`]).
+//! 2. **DXGI + PDH** ([`super::windows_gpu_perf`]) — true 64-bit memory
+//!    capacity, used memory, and utilization. Vendor-neutral.
+//! 3. **Level Zero Sysman** — temperature, power, frequency, fan.
+//!
+//! Level Zero is always compiled on Windows (the `all_smi_level_zero`
+//! cfg alias from `build.rs`): `ze_loader.dll` ships with the Intel
+//! graphics driver, and nothing else on Windows supplies those fields.
+//! It is `dlopen`ed, never linked, so a host without the driver simply
+//! keeps the layer-2 readings.
+//!
+//! Each field records where it came from in a `Source: *` detail key, and
+//! `detail["Metrics Source"]` accumulates the layers that contributed —
+//! e.g. `"WMI + DXGI + PDH + Level Zero Sysman"`.
 
 use crate::device::GpuReader;
-use crate::device::readers::intel_gpu_names::classify_intel_architecture;
+use crate::device::readers::intel_gpu_names::{classify_intel_architecture, intel_variant};
 use crate::device::types::{GpuInfo, ProcessInfo};
 use crate::utils::get_hostname;
 use chrono::Local;
@@ -96,7 +102,7 @@ pub struct IntelWindowsGpuReader {
     /// power reading is meaningful from the second refresh onward).
     /// Behind a `Mutex` because the public `&self` methods are called
     /// concurrently by the collector thread and the API server.
-    #[cfg(feature = "level_zero")]
+    #[cfg(all_smi_level_zero)]
     level_zero_state:
         Mutex<HashMap<String, crate::device::readers::intel_gpu_level_zero::LevelZeroState>>,
     /// Adapter LUID to `(device index, GPU uuid)`, recorded by
@@ -114,7 +120,7 @@ impl Default for IntelWindowsGpuReader {
 impl IntelWindowsGpuReader {
     pub fn new() -> Self {
         Self {
-            #[cfg(feature = "level_zero")]
+            #[cfg(all_smi_level_zero)]
             level_zero_state: Mutex::new(HashMap::new()),
             adapter_index: Mutex::new(Default::default()),
         }
@@ -142,6 +148,17 @@ impl IntelWindowsGpuReader {
                         .pnp_device_i_d
                         .clone()
                         .unwrap_or_else(|| format!("Intel-GPU-{idx}"));
+
+                    // The PCI device ID is the authoritative discrete-vs-
+                    // integrated signal. It is available here, whereas
+                    // DXGI's shared-memory verdict only arrives later in
+                    // `augment_gpus` — so the variant is decided from this
+                    // rather than from the marketing name.
+                    let pci_device_id = controller
+                        .pnp_device_i_d
+                        .as_deref()
+                        .and_then(crate::device::readers::windows_gpu_perf::ids::parse_pnp_device_id)
+                        .map(|ids| ids.device);
 
                     // LIMITATION: Win32_VideoController.AdapterRAM is a
                     // 32-bit uint32 in WMI, capped at 4GB. For an
@@ -175,7 +192,7 @@ impl IntelWindowsGpuReader {
                     }
                     detail.insert(
                         "Variant".to_string(),
-                        classify_intel_variant(&name).to_string(),
+                        intel_variant(pci_device_id, &name).to_string(),
                     );
                     // Architecture / SYCL classification — shared with
                     // the Linux reader via `intel_gpu_names::classify_*`
@@ -189,21 +206,13 @@ impl IntelWindowsGpuReader {
                         "SYCL Capable".to_string(),
                         arch.sycl_capable_label().to_string(),
                     );
-                    // `Metrics Source` advertises which backend
-                    // produced the metrics. WMI on its own surfaces no
-                    // utilization / temperature / power; the level_zero
-                    // augmentation below upgrades this string when L0
-                    // produces a readout. The legacy `Note` key is
-                    // retained for compatibility with downstream
-                    // consumers but conveys the same meaning.
-                    detail.insert(
-                        "Metrics Source".to_string(),
-                        "WMI".to_string(),
-                    );
-                    detail.insert(
-                        "Note".to_string(),
-                        "Detailed metrics require Level Zero / xpu-smi".to_string(),
-                    );
+                    // `Metrics Source` advertises which backends produced
+                    // the metrics; the DXGI/PDH and Level Zero layers
+                    // append themselves to it as they run. The `Note` key
+                    // explaining what is missing is added afterwards by
+                    // `annotate_missing_metrics`, once we know what the
+                    // later layers actually managed to supply.
+                    detail.insert("Metrics Source".to_string(), "WMI".to_string());
                     detail.insert("Source: Utilization".to_string(), "unavailable".to_string());
                     detail.insert("Source: Temperature".to_string(), "unavailable".to_string());
                     detail.insert("Source: Power".to_string(), "unavailable".to_string());
@@ -270,8 +279,11 @@ impl GpuReader for IntelWindowsGpuReader {
         if let Ok(mut guard) = self.adapter_index.lock() {
             *guard = adapter_index;
         }
-        #[cfg(feature = "level_zero")]
+        #[cfg(all_smi_level_zero)]
         self.augment_with_level_zero(&mut gpus);
+        for gpu in &mut gpus {
+            annotate_missing_metrics(gpu);
+        }
         gpus
     }
 
@@ -290,7 +302,7 @@ impl GpuReader for IntelWindowsGpuReader {
     }
 }
 
-#[cfg(feature = "level_zero")]
+#[cfg(all_smi_level_zero)]
 impl IntelWindowsGpuReader {
     /// Layer Level Zero metrics on top of the WMI baseline. Each
     /// Intel WMI controller is paired with an L0 device by ordinal
@@ -329,6 +341,44 @@ impl IntelWindowsGpuReader {
             }
         }
     }
+}
+
+/// Explain which metrics are still missing, once every layer has run.
+///
+/// The reader used to publish a blanket "Detailed metrics require Level
+/// Zero / xpu-smi" note on every poll. That is now actively misleading:
+/// Level Zero is compiled into every Windows build and, on a host with
+/// the Intel driver installed, supplies most of what the note asks for.
+/// It is also incomplete — an Intel iGPU typically exposes no Sysman
+/// temperature sensor at all, so the note fired on hosts where nothing
+/// was wrong and no action would help.
+///
+/// So name the fields that are actually absent, and say nothing when they
+/// are all present.
+fn annotate_missing_metrics(gpu: &mut GpuInfo) {
+    use crate::device::readers::detail_keys::missing_metric_sources;
+    const REPORTED: &[&str] = &["Temperature", "Power", "Frequency", "Utilization"];
+
+    let missing = missing_metric_sources(&gpu.detail, REPORTED);
+
+    if missing.is_empty() {
+        gpu.detail.remove("Note");
+        return;
+    }
+
+    let fields = missing.join(", ");
+    let note = if cfg!(all_smi_level_zero) {
+        // The backend is present, so the gap is the runtime or the
+        // hardware — not the build. Point at the two things an operator
+        // can actually check.
+        format!(
+            "{fields} unavailable: install the Intel graphics driver \
+             (ze_loader.dll) or this GPU exposes no such sensor"
+        )
+    } else {
+        format!("{fields} unavailable: build with --features level_zero")
+    };
+    gpu.detail.insert("Note".to_string(), note);
 }
 
 /// Detect Intel client GPU presence on Windows via WMI.
@@ -407,51 +457,28 @@ pub fn is_intel_gpu_name(name: &str) -> bool {
         "battlemage",
         "lunarlake",
         "lunar lake",
+        // Forward-looking. Panther Lake already passes via "arc" (it
+        // ships as "Intel(R) Arc(TM) B390 GPU"), but a future SKU sold as
+        // plain "Intel(R) Xe3 Graphics" would not. A bare "gpu" token is
+        // deliberately NOT in this list — it would admit non-graphics
+        // Intel devices the filter exists to exclude.
+        "xe2",
+        "xe3",
+        "panther lake",
+        "pantherlake",
+        "wildcat lake",
+        "celestial",
     ];
     FAMILY_TOKENS.iter().any(|t| lower.contains(t))
 }
 
-/// Heuristic discrete-vs-integrated discriminator for Intel client
-/// GPUs on Windows. We can't introspect VRAM reliably via WMI (the 32-bit
-/// `AdapterRAM` field is unreliable, see above) so we fall back to a
-/// name-pattern check that the test suite locks in.
-///
-/// The discriminator looks for an Arc model number — discrete Arc cards
-/// always carry one (e.g. `A770`, `A750`, `B580`, `B570`), while the
-/// Meteor Lake / Core Ultra iGPU is sold as "Intel(R) Arc(TM) Graphics"
-/// with no number. Iris / UHD / HD Graphics / Xe Graphics are always
-/// integrated.
-fn classify_intel_variant(name: &str) -> &'static str {
-    let lower = name.to_lowercase();
-    if !lower.contains("arc") {
-        return "Integrated";
-    }
-    // Heuristic: discrete Arc names contain a token like "a770", "b580"
-    // etc. — a letter A/B/C followed by 3+ digits. Scan word boundaries.
-    let has_model_number = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(is_arc_model_token);
-    if has_model_number {
-        "Discrete"
-    } else {
-        "Integrated"
-    }
-}
-
-/// `true` for tokens like `a770`, `a750`, `b580`, `c770` — a single
-/// letter (current Arc generations are A/B; reserve C/D for forward
-/// compatibility) followed by 3+ digits.
-fn is_arc_model_token(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    if bytes.len() < 4 {
-        return false;
-    }
-    let first = bytes[0] as char;
-    if !matches!(first, 'a' | 'b' | 'c' | 'd') {
-        return false;
-    }
-    bytes[1..].iter().all(|b| b.is_ascii_digit())
-}
+// The discrete-vs-integrated discriminator now lives in
+// `intel_gpu_names::intel_variant`, driven by the PCI device ID rather
+// than the marketing name — the name alone cannot separate a discrete Arc
+// B580 from an integrated Arc B390, since Intel reused the `B3xx` number
+// space across the Battlemage and Panther Lake families. It sits in that
+// module so the Linux CI runner exercises it; this one is Windows-gated
+// and never compiled there.
 
 #[cfg(test)]
 #[path = "intel_gpu_windows/tests.rs"]

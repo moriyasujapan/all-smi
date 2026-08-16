@@ -166,6 +166,20 @@ furiosa = ["furiosa-smi-rs"]
 # XMX `COMPUTE_SINGLE` class) and power via the Sysman energy counter.
 # See `src/device/readers/intel_gpu_level_zero.rs` for the full module
 # and issue #248 for the rationale and deferred surface.
+# Intel Level Zero (oneAPI) Sysman backend: GPU temperature, power,
+# frequency, and fan.
+#
+# No dependencies — the loader (`libze_loader.so.1` / `ze_loader.dll`) is
+# dlopen'd at runtime, so enabling this links nothing and a host without
+# the loader degrades to the sysfs/WMI baseline.
+#
+# Opt-in on Linux and macOS. On **Windows it is always compiled**,
+# regardless of this feature: `ze_loader.dll` ships with the Intel
+# graphics driver, and nothing else on Windows can supply those four
+# fields. Cargo cannot express a per-target default, so `build.rs` emits
+# an `all_smi_level_zero` cfg alias and the code gates on that. Note this
+# means `features:` in a support bundle does NOT tell you whether the
+# backend is present on Windows — `level_zero:` in version.txt does.
 level_zero = []
 
 [lib]

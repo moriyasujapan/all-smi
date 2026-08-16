@@ -95,7 +95,7 @@ The default build (`default = ["cli", "amd"]`) includes the full CLI, TUI, API s
 | `amd` | on | AMD GPU backend on glibc Linux via the `libamdgpu_top` crate. Disable to drop the `libdrm.so.2` / `libdrm_amdgpu.so.1` runtime dependency. |
 | `mock` | off | Builds the `all-smi-mock-server` binary that simulates GPU/NPU clusters. |
 | `furiosa` | off | Furiosa NPU backend via the `furiosa-smi-rs` crate (Linux targets). |
-| `level_zero` | off | Intel oneAPI Level Zero (Sysman) backend for Intel client GPUs. Dynamically loads `libze_loader.so.1` (Linux) / `ze_loader.dll` (Windows) at runtime; a missing runtime degrades silently to the sysfs/WMI baseline. |
+| `level_zero` | off (Linux/macOS)<br>**always on (Windows)** | Intel oneAPI Level Zero (Sysman) backend for Intel client GPUs. Dynamically loads `libze_loader.so.1` (Linux) / `ze_loader.dll` (Windows) at runtime; a missing runtime degrades silently to the sysfs/WMI baseline. Declares no dependencies, so compiling it costs nothing but the code size.<br><br>Cargo cannot express a per-target default, so `build.rs` emits an **`all_smi_level_zero`** cfg alias — set when the target is Windows **or** this feature is enabled — and all call sites gate on `#[cfg(all_smi_level_zero)]` rather than on the feature. Windows gets it unconditionally because `ze_loader.dll` ships with the Intel graphics driver and nothing else on Windows supplies GPU temperature, power, or frequency.<br><br>Consequence for support bundles: `features:` in `version.txt` reflects only the cargo feature, so on Windows it will *not* list `level_zero`. The separate `level_zero:` line reports the effective state. |
 
 ```bash
 # Example: build with the Intel Level Zero backend enabled

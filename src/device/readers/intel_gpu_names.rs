@@ -85,6 +85,13 @@ pub fn intel_gpu_marketing_name(device_id: u32) -> String {
             "Intel Graphics (Arrow/Lunar Lake)".to_string()
         }
 
+        // ---- Xe3 integrated on Panther Lake (Core Ultra series 3), sold as
+        // "Intel Arc B390 / B370 GPU". A range rather than a single ID
+        // because Intel ships a family of PTL-H / PTL-U graphics IDs; the
+        // canonical list is mesa's `include/pci_ids/` (see module docs).
+        // Wildcat Lake and discrete Celestial IDs are not yet catalogued.
+        0xB080..=0xB08F => "Intel Arc B-series iGPU (Panther Lake / Xe3)".to_string(),
+
         _ => String::new(),
     }
 }
@@ -113,12 +120,24 @@ pub fn resolve_intel_gpu_name(device_id: u32) -> String {
 /// re-implementing the same name-pattern table. The classification
 /// mirrors the `INTEL_GPU_PATTERNS` table in lablup/backend.ai-go's
 /// `src-tauri/src/engine/gpu.rs` so the two projects stay in agreement.
+///
+/// **Known divergence:** [`IntelArchitecture::Xe3`] is all-smi-only for
+/// now — backend.ai-go's table has no Panther Lake entry yet. Recorded
+/// here deliberately rather than left to drift silently; the two tables
+/// should be reconciled when that project gains Xe3 support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntelArchitecture {
     /// Arc A-series discrete (A310/A380/A580/A750/A770) — Alchemist (Xe-HPG).
     Alchemist,
     /// Arc B-series discrete (e.g. B580) — Battlemage (Xe2).
     Battlemage,
+    /// Xe3 integrated (Panther Lake / Core Ultra series 3 — Arc B390 / B370).
+    ///
+    /// Despite the "Arc B-series" marketing name these are integrated
+    /// parts, not Battlemage discrete cards. See
+    /// [`classify_intel_architecture`] for how the `B3xx` collision is
+    /// resolved.
+    Xe3,
     /// Xe-LPG integrated (Meteor Lake / Core Ultra Series 1).
     XeLpg,
     /// Xe-LPG+ integrated (Lunar Lake / Core Ultra Series 2 / Arc 140V/130V).
@@ -139,7 +158,12 @@ impl IntelArchitecture {
     pub fn is_sycl_capable(self) -> bool {
         matches!(
             self,
-            Self::Alchemist | Self::Battlemage | Self::XeLpg | Self::XeLpgPlus | Self::IrisXe,
+            Self::Alchemist
+                | Self::Battlemage
+                | Self::Xe3
+                | Self::XeLpg
+                | Self::XeLpgPlus
+                | Self::IrisXe,
         )
     }
 
@@ -148,6 +172,7 @@ impl IntelArchitecture {
         match self {
             Self::Alchemist => "Alchemist (Xe-HPG, A-series)",
             Self::Battlemage => "Battlemage (Xe2, B-series)",
+            Self::Xe3 => "Xe3 (Panther Lake)",
             Self::XeLpg => "Xe-LPG (Meteor Lake)",
             Self::XeLpgPlus => "Xe-LPG+ (Lunar Lake)",
             Self::IrisXe => "Iris Xe (Tiger/Alder/Raptor Lake)",
@@ -179,15 +204,22 @@ impl IntelArchitecture {
 ///
 /// 1. **Older integrated first** so a `HD Graphics 520` style name never
 ///    accidentally matches a later Xe-LPG / Iris Xe rule.
-/// 2. **Battlemage before Alchemist** because `Intel Arc B580` contains
+/// 2. **Xe3 before Battlemage.** Intel reused the `B3xx` number space
+///    across two architectures: `B380` is a discrete Battlemage SKU while
+///    `B390` / `B370` are the Panther Lake *integrated* GPUs. The name
+///    string alone cannot resolve that collision, so an explicit
+///    allow-list of Panther Lake tokens runs first. This is inherently
+///    fragile — which is precisely why [`intel_variant`] treats the PCI
+///    device ID, not the name, as authoritative for discrete-vs-integrated.
+/// 3. **Battlemage before Alchemist** because `Intel Arc B580` contains
 ///    the substring `arc` but is not Alchemist.
-/// 3. **Alchemist before Lunar Lake** for the same reason — Alchemist
+/// 4. **Alchemist before Lunar Lake** for the same reason — Alchemist
 ///    names contain a specific `a3`/`a5`/`a7` token, Lunar Lake's Arc
 ///    140V/130V names do not.
-/// 4. **Lunar Lake before generic Xe-LPG** because Lunar Lake is a
+/// 5. **Lunar Lake before generic Xe-LPG** because Lunar Lake is a
 ///    distinct architecture and we want it labelled `XeLpgPlus`, not the
 ///    Meteor Lake `XeLpg`.
-/// 5. **Generic Xe-LPG before Iris Xe** so Core Ultra (Meteor Lake) iGPU
+/// 6. **Generic Xe-LPG before Iris Xe** so Core Ultra (Meteor Lake) iGPU
 ///    names — sold as `Intel Arc Graphics` with no model number — land in
 ///    `XeLpg`, not in `IrisXe` or `Unknown`.
 ///
@@ -212,6 +244,19 @@ pub fn classify_intel_architecture(name: &str) -> IntelArchitecture {
         && !n.contains("xe")
     {
         return IntelArchitecture::OlderIntegrated;
+    }
+
+    // 1a. Xe3 / Panther Lake, BEFORE Battlemage. `PANTHER_LAKE_TOKENS` is
+    //     an allow-list rather than a pattern because `b380` (discrete
+    //     Battlemage) and `b390` (integrated Xe3) are one digit apart and
+    //     nothing in the name distinguishes them.
+    const PANTHER_LAKE_TOKENS: &[&str] = &["b390", "b370", "b350"];
+    if n.contains("xe3")
+        || n.contains("panther lake")
+        || n.contains("pantherlake")
+        || (n.contains("arc") && PANTHER_LAKE_TOKENS.iter().any(|t| n.contains(t)))
+    {
+        return IntelArchitecture::Xe3;
     }
 
     // 2. Battlemage — explicit family name, or Arc + a known B-series SKU.
@@ -241,7 +286,15 @@ pub fn classify_intel_architecture(name: &str) -> IntelArchitecture {
     //    family name, or any other Arc iGPU — by this point Alchemist and
     //    Lunar Lake have been ruled out, so a residual `arc` + `graphics`
     //    name (notably `Intel Arc Graphics`) is the Meteor Lake iGPU.
-    if (n.contains("xe") && n.contains("lpg")) || (n.contains("arc") && n.contains("graphics")) {
+    //
+    //    The `gpu` alternative is a safety net: Panther Lake ships as
+    //    `Intel(R) Arc(TM) B390 GPU` — a `GPU` suffix where every earlier
+    //    generation used `Graphics`. Rule 1a catches the known Xe3 SKUs;
+    //    this keeps any *future* Arc iGPU with that suffix inside the Xe
+    //    family rather than falling through to `Unknown`.
+    if (n.contains("xe") && n.contains("lpg"))
+        || (n.contains("arc") && (n.contains("graphics") || n.contains("gpu")))
+    {
         return IntelArchitecture::XeLpg;
     }
 
@@ -253,237 +306,103 @@ pub fn classify_intel_architecture(name: &str) -> IntelArchitecture {
     IntelArchitecture::Unknown
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ---------------------------------------------------------------------
+// Discrete vs. integrated
+// ---------------------------------------------------------------------
 
-    #[test]
-    fn known_families_resolve() {
-        assert!(intel_gpu_marketing_name(0x56A0).contains("Arc A770"));
-        assert!(intel_gpu_marketing_name(0x56A2).contains("Arc A750"));
-        assert!(intel_gpu_marketing_name(0xE20B).contains("Battlemage"));
-        assert!(intel_gpu_marketing_name(0x7D40).contains("Meteor Lake"));
-        assert!(intel_gpu_marketing_name(0x9A49).contains("Tiger Lake"));
-        assert!(intel_gpu_marketing_name(0x46A6).contains("Alder/Raptor Lake"));
-        assert!(intel_gpu_marketing_name(0x4C8A).contains("Rocket Lake"));
-        assert!(intel_gpu_marketing_name(0x8A50).contains("Ice Lake"));
-        assert!(intel_gpu_marketing_name(0xA780).contains("Arrow/Lunar Lake"));
+/// PCI device-ID ranges for Intel's **discrete** GPUs.
+///
+/// Intel has shipped a small, closed set of discrete parts, so an
+/// allow-list is both short and exact — and, crucially, it stays correct
+/// when a new *integrated* GPU ships. Only a new *discrete* product needs
+/// an entry here, and those are rare and highly visible.
+///
+/// The inverse formulation (a list of integrated ranges) was rejected: it
+/// would need updating for every new mobile SKU, and a missing entry would
+/// mislabel an iGPU as discrete — exactly the Arc B390 bug this replaces.
+const DISCRETE_INTEL_DEVICE_RANGES: &[std::ops::RangeInclusive<u32>] = &[
+    0x0BD0..=0x0BDB, // Ponte Vecchio / Data Center GPU Max
+    0x4F80..=0x4F8F, // DG2-G10/G11 alternate IDs (Arc A-series)
+    0x5690..=0x56BF, // DG2 / Alchemist (Arc A-series)
+    0xE200..=0xE2FF, // BMG-G21 / Battlemage (Arc B580 / B570)
+];
+
+/// Classify an Intel GPU as `"Discrete"` or `"Integrated"`.
+///
+/// Resolution order, strongest signal first:
+///
+/// 1. **PCI device ID**, when known. Authoritative: present in
+///    `DISCRETE_INTEL_DEVICE_RANGES` ⇒ discrete, absent ⇒ integrated.
+/// 2. **Architecture**, derived from the marketing name. Alchemist and
+///    Battlemage are discrete families; every other *known* architecture
+///    is integrated.
+/// 3. **Model-number heuristic**, only when the architecture could not be
+///    determined at all. Narrowed to known discrete SKU tokens so that a
+///    Panther Lake `b390` is not mistaken for a discrete B-series card.
+///
+/// The name-only path (steps 2-3) exists because callers such as the
+/// Linux sysfs reader may not have a device ID to hand. It is strictly a
+/// fallback: `Intel(R) Arc(TM) B390 GPU` is indistinguishable from a
+/// discrete B-series card by name alone, which is why step 1 wins.
+pub fn intel_variant(device_id: Option<u32>, name: &str) -> &'static str {
+    if let Some(id) = device_id {
+        let id = id & 0xFFFF;
+        return if DISCRETE_INTEL_DEVICE_RANGES.iter().any(|r| r.contains(&id)) {
+            "Discrete"
+        } else {
+            "Integrated"
+        };
     }
 
-    #[test]
-    fn unknown_falls_back_to_generic() {
-        let n = resolve_intel_gpu_name(0x1234);
-        assert!(n.starts_with("Intel Graphics (device"));
-        assert!(n.contains("0x1234"));
-    }
-
-    #[test]
-    fn high_bits_ignored() {
-        // Some lspci output reports IDs with the upper 16 bits set;
-        // we mask to the device portion before matching.
-        assert!(resolve_intel_gpu_name(0x0000_56A0).contains("Arc A770"));
-        assert!(resolve_intel_gpu_name(0xFFFF_56A0).contains("Arc A770"));
-    }
-
-    // ---------- Architecture classification tests ----------
-    //
-    // The fixtures below mirror lablup/backend.ai-go's `INTEL_GPU_PATTERNS`
-    // and `check_intel_sycl_support` tests so the two projects stay in
-    // agreement about what each marketing name means.
-
-    #[test]
-    fn classifies_arc_a_series_as_alchemist() {
-        for name in &[
-            "Intel Arc A770 Graphics",
-            "Intel Arc A750",
-            "Intel Arc A580",
-            "Intel Arc A380",
-            "Intel Arc A310",
-            "Intel(R) Arc(TM) A770 Graphics",
-        ] {
-            assert_eq!(
-                classify_intel_architecture(name),
-                IntelArchitecture::Alchemist,
-                "mis-classified: {name}"
-            );
-            assert!(IntelArchitecture::Alchemist.is_sycl_capable());
+    match classify_intel_architecture(name) {
+        IntelArchitecture::Alchemist | IntelArchitecture::Battlemage => "Discrete",
+        IntelArchitecture::Unknown => {
+            let lower = name.to_lowercase();
+            if !lower.contains("arc") {
+                return "Integrated";
+            }
+            if lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(is_known_discrete_model_token)
+            {
+                "Discrete"
+            } else {
+                "Integrated"
+            }
         }
-    }
-
-    #[test]
-    fn classifies_battlemage_b_series() {
-        for name in &[
-            "Intel Battlemage Graphics",
-            "Intel(R) Battlemage(TM) Graphics",
-            "Intel Arc B580",
-            "Intel(R) Arc(TM) B580 Graphics",
-        ] {
-            assert_eq!(
-                classify_intel_architecture(name),
-                IntelArchitecture::Battlemage,
-                "mis-classified: {name}"
-            );
-            assert!(IntelArchitecture::Battlemage.is_sycl_capable());
-        }
-    }
-
-    #[test]
-    fn classifies_core_ultra_integrated_arc_as_xe_lpg() {
-        // Arc integrated graphics on Core Ultra (Meteor Lake, no A-series
-        // model number) is Xe-LPG, not Alchemist.
-        assert_eq!(
-            classify_intel_architecture("Intel Arc Graphics"),
-            IntelArchitecture::XeLpg,
-        );
-        assert_eq!(
-            classify_intel_architecture("Intel(R) Arc(TM) Graphics"),
-            IntelArchitecture::XeLpg,
-        );
-        assert!(IntelArchitecture::XeLpg.is_sycl_capable());
-    }
-
-    #[test]
-    fn classifies_lunar_lake_arc_140v() {
-        // Arc 140V / 130V on Lunar Lake — should map to XeLpgPlus, not
-        // Alchemist. "140V" contains "a" in "140V Graphics" but no A3/A5/A7
-        // token, so the Alchemist matcher must not fire.
-        let result = classify_intel_architecture("Intel Arc 140V Graphics");
-        assert!(
-            matches!(
-                result,
-                IntelArchitecture::XeLpgPlus | IntelArchitecture::XeLpg
-            ),
-            "Arc 140V should classify as a Lunar Lake / Xe-LPG-family part, got {result:?}",
-        );
-        assert!(result.is_sycl_capable());
-
-        // Lunar Lake's other iGPU SKU.
-        let result_130v = classify_intel_architecture("Intel Arc 130V Graphics");
-        assert!(
-            matches!(
-                result_130v,
-                IntelArchitecture::XeLpgPlus | IntelArchitecture::XeLpg
-            ),
-            "Arc 130V should classify as a Lunar Lake / Xe-LPG-family part, got {result_130v:?}",
-        );
-    }
-
-    #[test]
-    fn classifies_iris_xe_as_iris_xe() {
-        for name in &["Intel Iris Xe Graphics", "Intel(R) Iris(R) Xe Graphics"] {
-            assert_eq!(
-                classify_intel_architecture(name),
-                IntelArchitecture::IrisXe,
-                "mis-classified: {name}"
-            );
-            assert!(IntelArchitecture::IrisXe.is_sycl_capable());
-        }
-    }
-
-    #[test]
-    fn classifies_xe_lpg_meteor_lake() {
-        assert_eq!(
-            classify_intel_architecture("Intel Xe-LPG Graphics"),
-            IntelArchitecture::XeLpg,
-        );
-    }
-
-    #[test]
-    fn classifies_lunar_lake_explicit() {
-        for name in &[
-            "Intel LunarLake Graphics",
-            "Intel(R) LunarLake(TM) Graphics",
-            "Intel Lunar Lake Graphics",
-        ] {
-            assert_eq!(
-                classify_intel_architecture(name),
-                IntelArchitecture::XeLpgPlus,
-                "mis-classified: {name}"
-            );
-            assert!(IntelArchitecture::XeLpgPlus.is_sycl_capable());
-        }
-    }
-
-    #[test]
-    fn older_integrated_is_not_sycl_capable() {
-        for name in &[
-            "Intel HD Graphics 630",
-            "Intel UHD Graphics 770",
-            "Intel HD Graphics 520",
-            "Intel UHD Graphics 620",
-        ] {
-            let arch = classify_intel_architecture(name);
-            assert_eq!(
-                arch,
-                IntelArchitecture::OlderIntegrated,
-                "mis-classified: {name}"
-            );
-            assert!(!arch.is_sycl_capable(), "{name} should not be SYCL capable");
-        }
-    }
-
-    #[test]
-    fn unknown_names_classified_as_unknown() {
-        let arch = classify_intel_architecture("Definitely Not An Intel GPU");
-        assert_eq!(arch, IntelArchitecture::Unknown);
-        assert!(!arch.is_sycl_capable());
-
-        // An empty name is also unknown.
-        assert_eq!(classify_intel_architecture(""), IntelArchitecture::Unknown);
-    }
-
-    #[test]
-    fn architecture_labels_are_stable() {
-        // Lock in the label strings so downstream consumers (which embed
-        // them in `detail["Architecture"]`) can rely on them.
-        assert_eq!(
-            IntelArchitecture::Alchemist.label(),
-            "Alchemist (Xe-HPG, A-series)"
-        );
-        assert_eq!(
-            IntelArchitecture::Battlemage.label(),
-            "Battlemage (Xe2, B-series)"
-        );
-        assert_eq!(IntelArchitecture::XeLpg.label(), "Xe-LPG (Meteor Lake)");
-        assert_eq!(IntelArchitecture::XeLpgPlus.label(), "Xe-LPG+ (Lunar Lake)");
-        assert_eq!(
-            IntelArchitecture::IrisXe.label(),
-            "Iris Xe (Tiger/Alder/Raptor Lake)"
-        );
-        assert_eq!(
-            IntelArchitecture::OlderIntegrated.label(),
-            "Pre-Xe (HD/UHD Graphics)"
-        );
-        assert_eq!(IntelArchitecture::Unknown.label(), "Unknown");
-    }
-
-    #[test]
-    fn sycl_capability_matches_backend_ai_go() {
-        // The five SYCL-capable architectures, mirrored from
-        // lablup/backend.ai-go's check_intel_sycl_support.
-        assert!(IntelArchitecture::Alchemist.is_sycl_capable());
-        assert!(IntelArchitecture::Battlemage.is_sycl_capable());
-        assert!(IntelArchitecture::XeLpg.is_sycl_capable());
-        assert!(IntelArchitecture::XeLpgPlus.is_sycl_capable());
-        assert!(IntelArchitecture::IrisXe.is_sycl_capable());
-        assert!(!IntelArchitecture::OlderIntegrated.is_sycl_capable());
-        assert!(!IntelArchitecture::Unknown.is_sycl_capable());
-    }
-
-    #[test]
-    fn sycl_capable_label_distinguishes_unknown_from_no() {
-        // The map-entry label must not collapse Unknown into "No" —
-        // downstream consumers need to know whether the GPU is *known*
-        // not to be SYCL-capable vs. unrecognised.
-        assert_eq!(IntelArchitecture::Alchemist.sycl_capable_label(), "Yes");
-        assert_eq!(IntelArchitecture::Battlemage.sycl_capable_label(), "Yes");
-        assert_eq!(IntelArchitecture::XeLpg.sycl_capable_label(), "Yes");
-        assert_eq!(IntelArchitecture::XeLpgPlus.sycl_capable_label(), "Yes");
-        assert_eq!(IntelArchitecture::IrisXe.sycl_capable_label(), "Yes");
-        assert_eq!(
-            IntelArchitecture::OlderIntegrated.sycl_capable_label(),
-            "No"
-        );
-        assert_eq!(IntelArchitecture::Unknown.sycl_capable_label(), "Unknown");
+        _ => "Integrated",
     }
 }
+
+/// `true` for tokens like `a770`, `a750`, `b580` — a single letter
+/// (current Arc generations are A/B; C/D reserved for forward
+/// compatibility) followed by 3+ digits.
+///
+/// Note this recognises the *shape* of an Arc model number, not whether
+/// the part is discrete: `b390` matches, yet names an integrated Panther
+/// Lake GPU. Use [`is_known_discrete_model_token`] to decide form factor.
+pub fn is_arc_model_token(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.len() < 4 {
+        return false;
+    }
+    let first = bytes[0] as char;
+    if !matches!(first, 'a' | 'b' | 'c' | 'd') {
+        return false;
+    }
+    bytes[1..].iter().all(|b| b.is_ascii_digit())
+}
+
+/// `true` for Arc model tokens that name a **discrete** card.
+///
+/// An Arc model number alone no longer implies discrete: Panther Lake's
+/// integrated GPUs are sold as `B390` / `B370`. So the shape test is
+/// narrowed by excluding the Xe3 iGPU tokens.
+fn is_known_discrete_model_token(token: &str) -> bool {
+    const INTEGRATED_ARC_MODEL_TOKENS: &[&str] = &["b390", "b370", "b350"];
+    is_arc_model_token(token) && !INTEGRATED_ARC_MODEL_TOKENS.contains(&token)
+}
+
+#[cfg(test)]
+#[path = "intel_gpu_names/tests.rs"]
+mod tests;
