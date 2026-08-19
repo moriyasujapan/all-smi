@@ -44,6 +44,39 @@ fn clamp_fan_rpm(rpm: Option<u32>) -> Option<u32> {
     rpm.map(|value| value.min(MAX_GPU_FAN_RPM))
 }
 
+/// Convert a `gpu_metrics` `average_socket_power` sample into watts.
+///
+/// The unit depends on which `gpu_metrics` table the kernel exposes:
+/// `gpu_metrics_v1_x` (discrete GPUs) reports **watts**, while
+/// `gpu_metrics_v2_x` / `v3_x` (APUs) report **milliwatts**. Dividing
+/// unconditionally by 1000 under-reported every discrete AMD GPU by a factor
+/// of 1000 - a Radeon Pro VII drawing 188 W was published as `0.188`.
+///     ref: `libdrm_amdgpu_sys` `amdgpu/gpu_metrics/metrics_table/v1.rs`
+///          vs `amdgpu/gpu_metrics/metrics_table/v2_v3.rs`
+fn metrics_socket_power_to_watts(raw: u32, format_revision: Option<u8>) -> f64 {
+    let watts = match format_revision {
+        // APU tables (`v2_x`, `v3_x`) carry milliwatts.
+        Some(2) | Some(3) => raw as f64 / 1000.0,
+        // `v1_x` is already watts. An unreadable header is treated as the
+        // discrete-GPU case because that is the only format `GpuMetrics`
+        // yields for a dGPU, which is what this reader is used for.
+        _ => raw as f64,
+    };
+
+    watts.clamp(0.0, MAX_GPU_POWER_WATTS)
+}
+
+/// Convert a `libamdgpu_top` hwmon power sensor reading into watts.
+///
+/// `HwmonPower::from_hwmon_path_with_type` already divides the raw
+/// `power1_average` / `power1_input` microwatts by 1_000_000, and the field is
+/// declared `pub value: u32, // W`. The value must therefore be used as-is;
+/// scaling it again by 1000 produced the same 1000x under-report as the
+/// `gpu_metrics` path above.
+fn hwmon_power_to_watts(value: u32) -> f64 {
+    (value as f64).clamp(0.0, MAX_GPU_POWER_WATTS)
+}
+
 /// Per-device state that needs to be cached
 ///
 /// # Thread Safety
@@ -453,9 +486,12 @@ impl GpuReader for AmdGpuReader {
                     utilization = (gfx_activity as f64).clamp(0.0, MAX_GPU_UTILIZATION);
                 }
                 if let Some(power) = metrics.get_average_socket_power() {
-                    // Validate power consumption
-                    let watts = power as f64 / 1000.0; // Convert mW to W
-                    power_consumption = watts.clamp(0.0, MAX_GPU_POWER_WATTS);
+                    // Validate power consumption. The unit is table-format
+                    // dependent, so it cannot be scaled unconditionally.
+                    power_consumption = metrics_socket_power_to_watts(
+                        power,
+                        metrics.get_header().map(|header| header.format_revision),
+                    );
                 }
                 if let Some(temp) = metrics.get_temperature_edge() {
                     // Validate temperature
@@ -475,11 +511,9 @@ impl GpuReader for AmdGpuReader {
                 }
                 if power_consumption == 0.0 {
                     if let Some(ref p) = s.average_power {
-                        let watts = p.value as f64 / 1000.0; // Convert mW to W
-                        power_consumption = watts.clamp(0.0, MAX_GPU_POWER_WATTS);
+                        power_consumption = hwmon_power_to_watts(p.value);
                     } else if let Some(ref p) = s.input_power {
-                        let watts = p.value as f64 / 1000.0; // Convert mW to W
-                        power_consumption = watts.clamp(0.0, MAX_GPU_POWER_WATTS);
+                        power_consumption = hwmon_power_to_watts(p.value);
                     }
                 }
                 if temperature == 0
@@ -788,6 +822,76 @@ mod tests {
         assert!(
             typical_boost_freq < MAX_GPU_FREQ_MHZ,
             "Should support typical boost frequencies"
+        );
+    }
+
+    #[test]
+    fn metrics_socket_power_is_watts_on_discrete_gpu_tables() {
+        // `gpu_metrics_v1_x` is what the kernel exposes for a dGPU and it
+        // already reports watts. This is the regression the 1000x
+        // under-report came from: a Radeon Pro VII idling at 15 W and one
+        // under load at 188 W were published as 0.015 and 0.188.
+        assert_eq!(metrics_socket_power_to_watts(15, Some(1)), 15.0);
+        assert_eq!(metrics_socket_power_to_watts(188, Some(1)), 188.0);
+    }
+
+    #[test]
+    fn metrics_socket_power_is_milliwatts_on_apu_tables() {
+        // `gpu_metrics_v2_x` / `v3_x` (APUs) report milliwatts, so these must
+        // still be scaled down.
+        assert_eq!(metrics_socket_power_to_watts(15_000, Some(2)), 15.0);
+        assert_eq!(metrics_socket_power_to_watts(45_500, Some(3)), 45.5);
+    }
+
+    #[test]
+    fn metrics_socket_power_treats_an_unreadable_header_as_watts() {
+        // `GpuMetrics` only yields `v1_x` for discrete GPUs, so a missing or
+        // unrecognised header must not silently divide a watt reading.
+        assert_eq!(metrics_socket_power_to_watts(188, None), 188.0);
+        assert_eq!(metrics_socket_power_to_watts(188, Some(4)), 188.0);
+    }
+
+    #[test]
+    fn metrics_socket_power_is_clamped() {
+        // A garbled sample must not propagate an absurd wattage, and the
+        // unsupported-value sentinel (0xFFFF / 0xFFFFFFFF) must not either.
+        assert_eq!(
+            metrics_socket_power_to_watts(u32::MAX, Some(1)),
+            MAX_GPU_POWER_WATTS
+        );
+        assert_eq!(
+            metrics_socket_power_to_watts(0xFFFF, Some(1)),
+            MAX_GPU_POWER_WATTS
+        );
+        assert_eq!(metrics_socket_power_to_watts(0, Some(1)), 0.0);
+    }
+
+    #[test]
+    fn hwmon_power_is_already_watts() {
+        // `HwmonPower::value` is documented `// W` and is produced by
+        // `saturating_div(1_000_000)` from the raw microwatt sysfs node, so
+        // the fallback path must not scale it again.
+        assert_eq!(hwmon_power_to_watts(15), 15.0);
+        assert_eq!(hwmon_power_to_watts(188), 188.0);
+        assert_eq!(hwmon_power_to_watts(0), 0.0);
+    }
+
+    #[test]
+    fn hwmon_power_is_clamped() {
+        assert_eq!(hwmon_power_to_watts(u32::MAX), MAX_GPU_POWER_WATTS);
+    }
+
+    #[test]
+    fn amd_power_paths_agree_for_the_same_discrete_gpu() {
+        // The `gpu_metrics` reading and the hwmon fallback describe the same
+        // quantity, so for a dGPU they must land on the same watt value.
+        // Before the fix they agreed only in being 1000x too small.
+        let watts_from_metrics = metrics_socket_power_to_watts(188, Some(1));
+        let watts_from_hwmon = hwmon_power_to_watts(188);
+        assert_eq!(watts_from_metrics, watts_from_hwmon);
+        assert!(
+            watts_from_metrics > 1.0,
+            "a loaded GPU must not report a sub-watt draw"
         );
     }
 
