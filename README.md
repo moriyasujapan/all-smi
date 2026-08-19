@@ -23,6 +23,89 @@ The application presents a terminal-based user interface with cluster overview, 
 
 <p align="center">Node view (remote mode)</p>
 
+## Fork note: gfx906 power reporting fix
+
+This is a fork of [lablup/all-smi](https://github.com/lablup/all-smi). It exists to carry one
+fix that is not in upstream; no pull request has been opened against upstream, so the change
+lives here only.
+
+### Symptom
+
+On gfx906 (Vega20 — Radeon Pro VII, Radeon Instinct MI50, and the `0x66a0` Radeon Graphics
+variant), `all-smi` reported GPU power at **1/1000 of the real value**. A card idling at 15 W
+was published as `0.015`, and one drawing 188 W as `0.188`, in both the TUI and the
+`all-smi api` Prometheus output.
+
+### Cause
+
+Two independent paths in `src/device/readers/amd.rs` were each off by the same factor of 1000.
+
+**1. The `gpu_metrics` path.** `average_socket_power` was scaled unconditionally with a
+`// Convert mW to W` division, but the unit depends on which metrics table the kernel exposes:
+
+| table | hardware | unit |
+|---|---|---|
+| `gpu_metrics_v1_x` | discrete GPUs | **watts** |
+| `gpu_metrics_v2_x` / `v3_x` | APUs | **milliwatts** |
+
+(see `libdrm_amdgpu_sys`, `amdgpu/gpu_metrics/metrics_table/v1.rs` versus
+`metrics_table/v2_v3.rs`). Only the APU case matched the code, so every discrete AMD GPU was
+divided by 1000 it should not have been. The fix branches on
+`metrics_table_header::format_revision`.
+
+**2. The hwmon fallback path.** `libamdgpu_top`'s `HwmonPower` has *already* converted the raw
+`power1_average` / `power1_input` microwatt sysfs reading to watts — it applies
+`saturating_div(1_000_000)` and declares the field `pub value: u32, // W` — yet the value was
+divided by 1000 again. This one was hard to notice because the branch only runs when
+`power_consumption == 0.0`, and the `gpu_metrics` path above had already stored a non-zero
+(if 1000x too small) value, so the fallback never fired.
+
+Both conversions now live in named helpers, `metrics_socket_power_to_watts` and
+`hwmon_power_to_watts`, so the unit contract is stated once and is covered by tests. The
+existing `MAX_GPU_POWER_WATTS` clamp is preserved on both.
+
+### Verification
+
+Measured on a Dell PowerEdge T440 with 2x Radeon Pro VII and 1x Radeon Graphics (`0x66a0`),
+all gfx906/Vega20, running ROCm 7.14.0 / AMDSMI 26.5.0 / amdgpu 6.12.12 on x86_64 glibc.
+
+Sampled at the same moment against `rocm-smi -P` and the raw `hwmon/power1_input` sysfs node:
+
+| BDF | `power1_input` | `rocm-smi -P` | `all-smi` before | `all-smi` after |
+|---|---|---|---|---|
+| `0000:b3:00.0` | 15,000,000 uW | 15 W | `0.015` | `15` |
+| `0000:b6:00.0` | 15,000,000 uW | 15 W | `0.015` | `15` |
+| `0000:b9:00.0` | 168,000,000 uW | 188 W | `0.202` | `~188` |
+
+The three readings drift by a few watts between each other because the load moves across the
+cards within seconds and the three tools sample at slightly different instants; the point is
+the order of magnitude, which now agrees.
+
+### Tests
+
+Seven tests were added in `src/device/readers/amd.rs`, using the measured 15 W / 188 W values
+above as the regression cases:
+
+```
+metrics_socket_power_is_watts_on_discrete_gpu_tables
+metrics_socket_power_is_milliwatts_on_apu_tables
+metrics_socket_power_treats_an_unreadable_header_as_watts
+metrics_socket_power_is_clamped
+hwmon_power_is_already_watts
+hwmon_power_is_clamped
+amd_power_paths_agree_for_the_same_discrete_gpu
+```
+
+### Building
+
+`luwen-api` is an unconditional `cfg(target_os = "linux")` dependency, so `protoc` is required
+to build on Linux at all, which the upstream README does not currently state:
+
+```bash
+apt-get install protobuf-compiler
+cargo build --release
+```
+
 ## Installation
 
 ### Option 1: Install via Homebrew (macOS/Linux)
